@@ -6,6 +6,7 @@ type YouniumSubscription = {
   id?: string;
   status?: string;
   accountNumber?: string | null;
+  account?: unknown;
   effectiveStartDate?: string | null;
   effectiveEndDate?: string | null;
   cancellationDate?: string | null;
@@ -183,6 +184,45 @@ function isActiveSubscription(subscription: YouniumSubscription): subscription i
   return subscription.status === 'Active' && typeof subscription.id === 'string' && subscription.id.length > 0;
 }
 
+function asNonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function resolveAccountNumber(subscription: YouniumSubscription): string | null {
+  const direct = asNonEmptyString(subscription.accountNumber);
+  if (direct) {
+    return direct;
+  }
+
+  const account = subscription.account;
+
+  if (Array.isArray(account)) {
+    for (const item of account) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const nested = asNonEmptyString((item as Record<string, unknown>).accountNumber);
+      if (nested) {
+        return nested;
+      }
+    }
+
+    return null;
+  }
+
+  if (account && typeof account === 'object') {
+    return asNonEmptyString((account as Record<string, unknown>).accountNumber);
+  }
+
+  return null;
+}
+
 Deno.serve(async (request: Request) => {
   if (request.method !== 'POST') {
     return jsonResponse(405, { error: 'Method not allowed. Use POST.' });
@@ -230,7 +270,7 @@ Deno.serve(async (request: Request) => {
         const nowIso = new Date().toISOString();
         const rows = activeSubscriptions.map((subscription) => ({
           subscription_id: subscription.id,
-          account_number: subscription.accountNumber ?? null,
+          account_number: resolveAccountNumber(subscription),
           status: subscription.status,
           effective_start_date: subscription.effectiveStartDate ?? null,
           effective_end_date: subscription.effectiveEndDate ?? null,
