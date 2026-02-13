@@ -1088,11 +1088,14 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const createdCount = getRecordNumberValue(createCall.body, 'created') ?? 0;
     const processedCount = getRecordNumberValue(createCall.body, 'processed') ?? 0;
     const createErrors = getRecordNumberValue(createCall.body, 'errors') ?? 0;
+    const skippedLocked = getRecordNumberValue(createCall.body, 'skipped_locked') ?? 0;
     const createdDealId = getFirstCreatedDealId(createCall.body);
 
     let message = result.message;
     if (createCall.status === 200 && createdCount > 0) {
       message = 'Renewal queued and created immediately.';
+    } else if (createCall.status === 200 && skippedLocked > 0 && createErrors === 0) {
+      message = 'Renewal is already being processed from a prior request. No duplicate was created.';
     } else if (createCall.status === 200 && processedCount === 0) {
       message = 'Renewal queued, but no ready row was found for immediate creation. It will run in scheduled automation.';
     } else if (createCall.status !== 200 || createErrors > 0) {
@@ -1109,6 +1112,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         create_response: createCall.body,
         created_count: createdCount,
         processed_count: processedCount,
+        skipped_locked: skippedLocked,
         errors_count: createErrors,
         created_deal_id: createdDealId
       },

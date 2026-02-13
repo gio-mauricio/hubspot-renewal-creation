@@ -30,6 +30,8 @@ type RowResult = {
   term_end_date: string;
   source_hubspot_deal_id: string;
   created_deal_id?: string;
+  calculated_amount?: string;
+  status_note?: string;
   line_items_created_count: number;
   line_items_deduped_count: number;
   line_items_error_count: number;
@@ -77,6 +79,7 @@ type LineItemRunSummary = {
   dedupedCount: number;
   errorCount: number;
   lineItemIds: string[];
+  associatedLineItemIds: string[];
   errorSamples: string[];
   dryRunPayloadSamples: Array<Record<string, string>>;
   dryRunFingerprintSamples: string[];
@@ -319,6 +322,78 @@ function extractHubSpotMessage(body: unknown, fallback: string): string {
   }
 
   return fallback;
+}
+
+async function fetchAssociatedCompanyId(token: string, sourceDealId: string): Promise<string | null> {
+  const response = await fetch(
+    `https://api.hubapi.com/crm/v3/objects/deals/${encodeURIComponent(sourceDealId)}/associations/companies`,
+    {
+      method: 'GET',
+      headers: getHubSpotHeaders(token)
+    }
+  );
+
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok) {
+    const message = extractHubSpotMessage(body, text || `HTTP ${response.status}`);
+    throw new Error(`Failed to fetch associated company for deal ${sourceDealId}: ${message}`);
+  }
+
+  if (!isRecord(body) || !Array.isArray(body.results) || body.results.length === 0) {
+    return null;
+  }
+
+  const first = body.results[0];
+  if (!isRecord(first)) {
+    return null;
+  }
+
+  return asNonEmptyString(first.id);
+}
+
+async function fetchCompanyDomain(token: string, companyId: string): Promise<string | null> {
+  const url = new URL(`https://api.hubapi.com/crm/v3/objects/companies/${encodeURIComponent(companyId)}`);
+  url.searchParams.set('properties', 'domain');
+
+  const response = await fetch(url.toString(), {
+    method: 'GET',
+    headers: getHubSpotHeaders(token)
+  });
+
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok) {
+    const message = extractHubSpotMessage(body, text || `HTTP ${response.status}`);
+    throw new Error(`Failed to fetch company ${companyId}: ${message}`);
+  }
+
+  if (!isRecord(body) || !isRecord(body.properties)) {
+    return null;
+  }
+
+  return asNonEmptyString(body.properties.domain);
+}
+
+async function fetchSourceDealCompanyDomain(token: string, sourceDealId: string): Promise<string | null> {
+  const companyId = await fetchAssociatedCompanyId(token, sourceDealId);
+  if (!companyId) {
+    return null;
+  }
+
+  return fetchCompanyDomain(token, companyId);
 }
 
 function parseLimit(raw: unknown): number | null {
@@ -882,6 +957,97 @@ async function associateDealToLineItem(token: string, dealId: string, lineItemId
   throw new Error(`Association failed: ${message}`);
 }
 
+function toHubSpotAmountString(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '0.00';
+  }
+
+  return value.toFixed(2);
+}
+
+async function fetchLineItemsNetTcv(token: string, lineItemIds: string[]): Promise<number> {
+  if (lineItemIds.length === 0) {
+    return 0;
+  }
+
+  let total = 0;
+  const chunkSize = 100;
+
+  for (let i = 0; i < lineItemIds.length; i += chunkSize) {
+    const chunk = lineItemIds.slice(i, i + chunkSize);
+
+    const response = await fetch('https://api.hubapi.com/crm/v3/objects/line_items/batch/read', {
+      method: 'POST',
+      headers: {
+        ...getHubSpotHeaders(token),
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        properties: ['hs_tcv'],
+        inputs: chunk.map((id) => ({ id }))
+      })
+    });
+
+    const text = await response.text();
+    let body: unknown = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+
+    if (!response.ok) {
+      const message = extractHubSpotMessage(body, text || `HTTP ${response.status}`);
+      throw new Error(`Line item batch read failed: ${message}`);
+    }
+
+    if (!isRecord(body) || !Array.isArray(body.results)) {
+      continue;
+    }
+
+    for (const result of body.results) {
+      if (!isRecord(result) || !isRecord(result.properties)) {
+        continue;
+      }
+
+      const tcv = asFiniteNumber(result.properties.hs_tcv);
+      if (tcv != null) {
+        total += tcv;
+      }
+    }
+  }
+
+  return total;
+}
+
+async function updateDealAmount(token: string, dealId: string, amount: number): Promise<void> {
+  const response = await fetch(`https://api.hubapi.com/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
+    method: 'PATCH',
+    headers: {
+      ...getHubSpotHeaders(token),
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      properties: {
+        amount: toHubSpotAmountString(amount)
+      }
+    })
+  });
+
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok) {
+    const message = extractHubSpotMessage(body, text || `HTTP ${response.status}`);
+    throw new Error(`Deal amount update failed: ${message}`);
+  }
+}
+
 async function readLedgerMetadata(
   supabase: ReturnType<typeof createClient>,
   row: Pick<ReadyRow, 'subscription_id' | 'term_end_date'>
@@ -908,13 +1074,15 @@ async function readLedgerMetadata(
 async function markLedgerError(
   supabase: ReturnType<typeof createClient>,
   row: ReadyRow,
-  message: string
+  message: string,
+  extraMetadata?: Record<string, unknown>
 ): Promise<void> {
   const nowIso = new Date().toISOString();
   const existingMetadata = await readLedgerMetadata(supabase, row);
 
   const mergedMetadata = {
     ...existingMetadata,
+    ...(extraMetadata ?? {}),
     source_hubspot_deal_id: row.source_hubspot_deal_id,
     hubspot_error: message,
     hubspot_error_at: nowIso
@@ -935,6 +1103,62 @@ async function markLedgerError(
   }
 }
 
+async function releaseLedgerForRetry(
+  supabase: ReturnType<typeof createClient>,
+  row: ReadyRow,
+  message: string
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const existingMetadata = await readLedgerMetadata(supabase, row);
+
+  const mergedMetadata = {
+    ...existingMetadata,
+    source_hubspot_deal_id: row.source_hubspot_deal_id,
+    hubspot_error: message,
+    hubspot_error_at: nowIso
+  };
+
+  const { error } = await supabase
+    .from('renewal_ledger')
+    .update({
+      status: 'planned',
+      metadata: mergedMetadata,
+      updated_at: nowIso
+    })
+    .eq('subscription_id', row.subscription_id)
+    .eq('term_end_date', row.term_end_date)
+    .eq('status', 'processing');
+
+  if (error) {
+    throw new Error(`Failed to release renewal_ledger row back to planned: ${error.message}`);
+  }
+}
+
+async function claimLedgerForProcessing(
+  supabase: ReturnType<typeof createClient>,
+  row: ReadyRow
+): Promise<boolean> {
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from('renewal_ledger')
+    .update({
+      status: 'processing',
+      updated_at: nowIso
+    })
+    .eq('subscription_id', row.subscription_id)
+    .eq('term_end_date', row.term_end_date)
+    .eq('status', 'planned')
+    .is('hubspot_deal_id', null)
+    .select('subscription_id')
+    .limit(1);
+
+  if (error) {
+    throw new Error(`Failed to claim renewal_ledger row for processing: ${error.message}`);
+  }
+
+  return Array.isArray(data) && data.length > 0;
+}
+
 async function processLineItemsForRow(params: {
   config: RuntimeConfig;
   lineItemPropNames: Record<string, string>;
@@ -951,6 +1175,7 @@ async function processLineItemsForRow(params: {
   const charges = allCharges.filter(isRecurringAndNotCancelled);
 
   const lineItemIds: string[] = [];
+  const associatedLineItemIds: string[] = [];
   const uniqueLineItemIds = new Set<string>();
   const errorSamples: string[] = [];
   const dryRunPayloadSamples: Array<Record<string, string>> = [];
@@ -970,6 +1195,7 @@ async function processLineItemsForRow(params: {
   const pushLineItemId = (lineItemId: string): void => {
     if (!uniqueLineItemIds.has(lineItemId)) {
       uniqueLineItemIds.add(lineItemId);
+      associatedLineItemIds.push(lineItemId);
       if (lineItemIds.length < 50) {
         lineItemIds.push(lineItemId);
       }
@@ -1041,6 +1267,7 @@ async function processLineItemsForRow(params: {
     dedupedCount,
     errorCount,
     lineItemIds,
+    associatedLineItemIds,
     errorSamples,
     dryRunPayloadSamples,
     dryRunFingerprintSamples
@@ -1096,6 +1323,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   let processedCount = 0;
   let created = 0;
   let errors = 0;
+  let skippedLocked = 0;
   let results: RowResult[] = [];
 
   try {
@@ -1135,6 +1363,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     const readyRows = (readyRowsData ?? []) as ReadyRow[];
     processedCount = readyRows.length;
+    const companyDomainBySourceDeal = new Map<string, string | null>();
 
     for (const row of readyRows) {
       const resultBase = {
@@ -1148,6 +1377,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
       let lineItemsErrorCount = 0;
       let lineItemIds: string[] = [];
       let lineItemErrorSamples: string[] = [];
+      let rowClaimed = false;
+      let createdDealIdForRow: string | null = null;
+      let calculatedAmountForRow: string | null = null;
 
       try {
         const sourceDealUrl = new URL(`https://api.hubapi.com/crm/v3/objects/deals/${encodeURIComponent(row.source_hubspot_deal_id)}`);
@@ -1214,7 +1446,32 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const { forecastStart, forecastEnd, termMonths } = calculateForecastDates(sourceProperties, row);
         const closedateMs = termEndDateToEpochMs(row.term_end_date);
         const forecastContractStartDate = formatUtcDateMMDDYYYY(forecastStart);
-        const renewalDealName = `{COMPANY DOMAIN} Renewal ${forecastContractStartDate}`;
+
+        let associatedCompanyDomain: string | null = null;
+        if (companyDomainBySourceDeal.has(row.source_hubspot_deal_id)) {
+          associatedCompanyDomain = companyDomainBySourceDeal.get(row.source_hubspot_deal_id) ?? null;
+        } else {
+          try {
+            associatedCompanyDomain = await fetchSourceDealCompanyDomain(
+              config.hubspotToken,
+              row.source_hubspot_deal_id
+            );
+          } catch (domainError: unknown) {
+            const domainMessage = domainError instanceof Error ? domainError.message : String(domainError);
+            console.error(
+              `Failed to resolve associated company domain for source deal ${row.source_hubspot_deal_id}: ${domainMessage}`
+            );
+            associatedCompanyDomain = null;
+          }
+
+          companyDomainBySourceDeal.set(row.source_hubspot_deal_id, associatedCompanyDomain);
+        }
+
+        const dealNameDomain =
+          associatedCompanyDomain ??
+          getPropertyString(sourceProperties, 'deal_company_domain') ??
+          '{COMPANY DOMAIN}';
+        const renewalDealName = `${dealNameDomain} Renewal ${forecastContractStartDate}`;
         const forecastStartMs = String(forecastStart.getTime());
         const forecastEndMs = String(forecastEnd.getTime());
         const forecastEndYmd = formatUtcDateYYYYMMDD(forecastEnd);
@@ -1247,6 +1504,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
           if (value) {
             dealCreatePayload[field] = value;
           }
+        }
+
+        if (associatedCompanyDomain) {
+          dealCreatePayload.deal_company_domain = associatedCompanyDomain;
         }
 
         // Forecast overrides
@@ -1304,6 +1565,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
           continue;
         }
 
+        const claimed = await claimLedgerForProcessing(supabase, row);
+        if (!claimed) {
+          skippedLocked += 1;
+          results.push({
+            ...resultBase,
+            status_note: 'Skipped: renewal is already processing or already created by another run.',
+            line_items_created_count: 0,
+            line_items_deduped_count: 0,
+            line_items_error_count: 0,
+            line_item_ids: [],
+            line_item_error_samples: []
+          });
+          continue;
+        }
+        rowClaimed = true;
+
         const createDealResponse = await fetch('https://api.hubapi.com/crm/v3/objects/deals', {
           method: 'POST',
           headers: {
@@ -1326,6 +1603,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
         if (!createDealResponse.ok) {
           const responseMessage = extractHubSpotMessage(createDealBody, createDealText || `HTTP ${createDealResponse.status}`);
+          await releaseLedgerForRetry(supabase, row, `Failed to create forecast deal: ${responseMessage}`);
           errors += 1;
           results.push({
             ...resultBase,
@@ -1345,6 +1623,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
             : null;
 
         if (!createdDealId) {
+          await markLedgerError(supabase, row, 'HubSpot create deal response missing id');
           errors += 1;
           results.push({
             ...resultBase,
@@ -1357,6 +1636,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           });
           continue;
         }
+        createdDealIdForRow = createdDealId;
 
         if (requestOptions.createLineItems) {
           const lineItemSummary = await processLineItemsForRow({
@@ -1375,6 +1655,23 @@ Deno.serve(async (req: Request): Promise<Response> => {
           lineItemsErrorCount = lineItemSummary.errorCount;
           lineItemIds = lineItemSummary.lineItemIds;
           lineItemErrorSamples = lineItemSummary.errorSamples;
+
+          if (lineItemSummary.associatedLineItemIds.length > 0) {
+            try {
+              const netTcv = await fetchLineItemsNetTcv(
+                config.hubspotToken,
+                lineItemSummary.associatedLineItemIds
+              );
+              await updateDealAmount(config.hubspotToken, createdDealId, netTcv);
+              calculatedAmountForRow = toHubSpotAmountString(netTcv);
+            } catch (amountError: unknown) {
+              const amountMessage = amountError instanceof Error ? amountError.message : String(amountError);
+              lineItemsErrorCount += 1;
+              if (lineItemErrorSamples.length < 10) {
+                lineItemErrorSamples.push(amountMessage);
+              }
+            }
+          }
         }
 
         const nowIso = new Date().toISOString();
@@ -1384,6 +1681,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           ...existingMetadata,
           source_hubspot_deal_id: row.source_hubspot_deal_id,
           created_deal_id: createdDealId,
+          ...(calculatedAmountForRow ? { calculated_amount: calculatedAmountForRow } : {}),
           run_mode: config.runMode,
           timestamp: nowIso,
           ...(requestOptions.createLineItems
@@ -1409,10 +1707,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
           .eq('term_end_date', row.term_end_date);
 
         if (ledgerUpdateError) {
+          await markLedgerError(
+            supabase,
+            row,
+            `Deal created but renewal_ledger update failed: ${ledgerUpdateError.message}`,
+            { created_deal_id: createdDealId }
+          );
           errors += 1;
           results.push({
             ...resultBase,
             created_deal_id: createdDealId,
+            ...(calculatedAmountForRow ? { calculated_amount: calculatedAmountForRow } : {}),
             line_items_created_count: lineItemsCreatedCount,
             line_items_deduped_count: lineItemsDedupedCount,
             line_items_error_count: lineItemsErrorCount,
@@ -1427,6 +1732,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         results.push({
           ...resultBase,
           created_deal_id: createdDealId,
+          ...(calculatedAmountForRow ? { calculated_amount: calculatedAmountForRow } : {}),
           line_items_created_count: lineItemsCreatedCount,
           line_items_deduped_count: lineItemsDedupedCount,
           line_items_error_count: lineItemsErrorCount,
@@ -1435,9 +1741,25 @@ Deno.serve(async (req: Request): Promise<Response> => {
         });
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
+
+        if (!requestOptions.dryRun && rowClaimed) {
+          try {
+            if (createdDealIdForRow) {
+              await markLedgerError(supabase, row, message, { created_deal_id: createdDealIdForRow });
+            } else {
+              await releaseLedgerForRetry(supabase, row, message);
+            }
+          } catch (stateError: unknown) {
+            const stateMessage = stateError instanceof Error ? stateError.message : String(stateError);
+            console.error(`Failed to update renewal_ledger state after row error: ${stateMessage}`);
+          }
+        }
+
         errors += 1;
         results.push({
           ...resultBase,
+          ...(createdDealIdForRow ? { created_deal_id: createdDealIdForRow } : {}),
+          ...(calculatedAmountForRow ? { calculated_amount: calculatedAmountForRow } : {}),
           line_items_created_count: lineItemsCreatedCount,
           line_items_deduped_count: lineItemsDedupedCount,
           line_items_error_count: lineItemsErrorCount,
@@ -1461,6 +1783,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           requested_limit: requestOptions.limit ?? 'all',
           processed: processedCount,
           created,
+          skipped_locked: skippedLocked,
           errors,
           error_samples: results
             .filter((row) => Boolean(row.error))
@@ -1485,6 +1808,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         dry_run: requestOptions.dryRun,
         create_line_items: requestOptions.createLineItems,
         requested_limit: requestOptions.limit ?? 'all',
+        skipped_locked: skippedLocked,
         source_hubspot_deal_id: requestOptions.sourceHubspotDealId
       }
     });
@@ -1494,6 +1818,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       requested_source_hubspot_deal_id: requestOptions.sourceHubspotDealId,
       processed: processedCount,
       created,
+      skipped_locked: skippedLocked,
       errors,
       results,
       timestamp: new Date().toISOString()
@@ -1516,6 +1841,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
             requested_limit: requestOptions.limit ?? 'all',
             processed: processedCount,
             created,
+            skipped_locked: skippedLocked,
             errors
           }
         }
@@ -1532,6 +1858,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           dry_run: requestOptions.dryRun,
           create_line_items: requestOptions.createLineItems,
           requested_limit: requestOptions.limit ?? 'all',
+          skipped_locked: skippedLocked,
           source_hubspot_deal_id: requestOptions.sourceHubspotDealId
         }
       });
