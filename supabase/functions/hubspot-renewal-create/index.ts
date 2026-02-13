@@ -49,7 +49,7 @@ type SourceDealProperties = {
 };
 
 type RequestOptions = {
-  limit: number;
+  limit: number | null;
   dryRun: boolean;
   createLineItems: boolean;
 };
@@ -302,9 +302,9 @@ function extractHubSpotMessage(body: unknown, fallback: string): string {
   return fallback;
 }
 
-function parseLimit(raw: unknown): number {
+function parseLimit(raw: unknown): number | null {
   if (raw == null) {
-    return 5;
+    return null;
   }
 
   if (typeof raw !== 'number' || !Number.isFinite(raw)) {
@@ -315,7 +315,7 @@ function parseLimit(raw: unknown): number {
     throw new Error('Invalid request body: "limit" must be greater than 0');
   }
 
-  return Math.min(Math.floor(raw), 5);
+  return Math.floor(raw);
 }
 
 async function getRequestOptions(req: Request): Promise<RequestOptions> {
@@ -323,7 +323,7 @@ async function getRequestOptions(req: Request): Promise<RequestOptions> {
 
   if (!text.trim()) {
     return {
-      limit: 5,
+      limit: null,
       dryRun: false,
       createLineItems: false
     };
@@ -522,114 +522,8 @@ function findUnitPrice(charge: Record<string, unknown>): number | null {
   return null;
 }
 
-type ProductFrequencyLabel = 'Monthly' | 'Quarterly' | 'Annual' | 'Biannual';
-
-type ProductFrequencyOverride = {
-  name: string;
-  hubspotId: string;
-  frequency: ProductFrequencyLabel;
-};
-
-const PRODUCT_FREQUENCY_OVERRIDES: ProductFrequencyOverride[] = [
-  { name: 'Signature Plan', hubspotId: '2324781', frequency: 'Monthly' },
-  { name: 'Pipeline Plan', hubspotId: '3065596', frequency: 'Monthly' },
-  { name: 'Complete Plan', hubspotId: '3563937', frequency: 'Monthly' },
-  { name: 'Discount Recurring', hubspotId: '26391830', frequency: 'Annual' },
-  { name: 'Discount One-Time', hubspotId: '27215512', frequency: 'Annual' },
-  { name: 'Other (reccurring)', hubspotId: '27663040', frequency: 'Annual' },
-  { name: 'Other (one-time)', hubspotId: '27659258', frequency: 'Annual' },
-  { name: 'Monthly Billing Fee 20%', hubspotId: '38999861', frequency: 'Monthly' },
-  { name: 'Quarterly Billing Fee 10%', hubspotId: '39001604', frequency: 'Quarterly' },
-  { name: 'SPF Flattening - Tier 1', hubspotId: '1084489515', frequency: 'Annual' },
-  { name: 'Additional Domains', hubspotId: '1084337011', frequency: 'Annual' },
-  { name: 'Opensense Signature Package', hubspotId: '1483161702', frequency: 'Annual' },
-  { name: 'Opensense Pipeline Package', hubspotId: '1483153265', frequency: 'Annual' },
-  { name: 'Opensense Complete Package', hubspotId: '1483153267', frequency: 'Annual' },
-  { name: 'Platform License', hubspotId: '2081778700', frequency: 'Monthly' },
-  { name: 'Platform License - Premium', hubspotId: '2082106010', frequency: 'Monthly' },
-  { name: 'Platform License - Enterprise', hubspotId: '2081778701', frequency: 'Monthly' },
-  { name: 'Compliance Plan', hubspotId: '3379735458', frequency: 'Monthly' },
-  { name: 'Digital Business Cards', hubspotId: '16031140980', frequency: 'Monthly' },
-  { name: 'Signature Lite Plan', hubspotId: '20145631887', frequency: 'Monthly' },
-  { name: 'Discount - Volume', hubspotId: '25082565921', frequency: 'Annual' },
-  { name: 'Discount - Competitive', hubspotId: '25082194576', frequency: 'Annual' },
-  { name: 'Discount - Platform License', hubspotId: '25082194577', frequency: 'Annual' },
-  { name: 'Discount - Case Study', hubspotId: '25082565922', frequency: 'Annual' },
-  { name: 'Discount - Social Proof', hubspotId: '25082194579', frequency: 'Annual' },
-  { name: 'Discount Sales Incentives', hubspotId: '25082194581', frequency: 'Annual' },
-  { name: 'Discount - Events', hubspotId: '25082194582', frequency: 'Annual' },
-  { name: 'Discount - Waived Fees', hubspotId: '25082565924', frequency: 'Annual' },
-  { name: 'Bronze Engagement Plan', hubspotId: '33136518206', frequency: 'Monthly' },
-  { name: 'Silver Engagement Plan', hubspotId: '33136456258', frequency: 'Monthly' },
-  { name: 'Gold Engagement Plan', hubspotId: '33136518231', frequency: 'Monthly' },
-  { name: 'Signature Plan - GCC High', hubspotId: '40915323994', frequency: 'Monthly' },
-  { name: 'Pipeline Plan - GCC High', hubspotId: '40912561672', frequency: 'Monthly' },
-  { name: 'Complete Plan - GCC High', hubspotId: '40912561673', frequency: 'Monthly' },
-  { name: 'Bronze Engagement Plan - GCC High', hubspotId: '40912375845', frequency: 'Monthly' },
-  { name: 'Silver Engagement Plan - GCC High', hubspotId: '40912375846', frequency: 'Monthly' },
-  { name: 'Gold Engagement Plan - GCC High', hubspotId: '40912499776', frequency: 'Monthly' }
-];
-
 function normalizeLookupKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function productFrequencyLabelToHubspot(value: ProductFrequencyLabel): string {
-  if (value === 'Monthly') {
-    return 'monthly';
-  }
-  if (value === 'Quarterly') {
-    return 'quarterly';
-  }
-  if (value === 'Biannual') {
-    return 'per_six_months';
-  }
-  return 'annually';
-}
-
-const PRODUCT_FREQUENCY_LOOKUP: Record<string, string> = (() => {
-  const lookup: Record<string, string> = {};
-  for (const item of PRODUCT_FREQUENCY_OVERRIDES) {
-    const normalizedName = normalizeLookupKey(item.name);
-    const normalizedId = normalizeLookupKey(item.hubspotId);
-    const frequency = productFrequencyLabelToHubspot(item.frequency);
-
-    lookup[normalizedName] = frequency;
-    lookup[normalizedId] = frequency;
-  }
-
-  // Alias in case upstream spelling differs.
-  lookup[normalizeLookupKey('Other (recurring)')] = 'annually';
-
-  return lookup;
-})();
-
-function mapBillingPeriodToRecurringFrequency(value: unknown): string | null {
-  const raw = asNonEmptyString(value);
-  if (!raw) {
-    return null;
-  }
-
-  const normalized = raw.toLowerCase().replace(/[\s_-]+/g, '');
-  const mapping: Record<string, string> = {
-    // Younium billingPeriod values
-    annual: 'annually',
-    monthly: 'monthly',
-    quarterly: 'quarterly',
-    biannual: 'per_six_months',
-    endofterm: 'annually',
-    // Label/value compatibility
-    weekly: 'weekly',
-    everytwoweeks: 'biweekly',
-    semiannually: 'per_six_months',
-    annually: 'annually',
-    everytwoyears: 'per_two_years',
-    everythreeyears: 'per_three_years',
-    everyfouryears: 'per_four_years',
-    everyfiveyears: 'per_five_years'
-  };
-
-  return mapping[normalized] ?? null;
 }
 
 function getNestedString(record: Record<string, unknown>, key: string): string | null {
@@ -639,26 +533,6 @@ function getNestedString(record: Record<string, unknown>, key: string): string |
   }
 
   return asNonEmptyString(value);
-}
-
-function mapProductOverrideToRecurringFrequency(charge: Record<string, unknown>): string | null {
-  const candidateValues = [
-    asNonEmptyString(charge.name),
-    asNonEmptyString(charge.productName),
-    asNonEmptyString(charge.productId),
-    asNonEmptyString(charge.hubspotProductId),
-    getNestedString(charge, 'product')
-  ].filter((value): value is string => Boolean(value));
-
-  for (const candidate of candidateValues) {
-    const normalized = normalizeLookupKey(candidate);
-    const frequency = PRODUCT_FREQUENCY_LOOKUP[normalized];
-    if (frequency) {
-      return frequency;
-    }
-  }
-
-  return null;
 }
 
 function getChargeTextCandidates(charge: Record<string, unknown>): string[] {
@@ -673,85 +547,100 @@ function isOpensensePackageCharge(charge: Record<string, unknown>): boolean {
   const targets = new Set([
     'opensensesignaturepackage',
     'opensensepipelinepackage',
-    'opensensecompletepackage',
-    'opensenseengagementpackage'
+    'opensensecompletepackage'
   ]);
 
   return getChargeTextCandidates(charge).some((value) => targets.has(normalizeLookupKey(value)));
 }
 
-function isPlatformLicenseDiscountCharge(charge: Record<string, unknown>): boolean {
-  const targets = ['discountplatformlicense', 'discountlegacyplatformlicense'];
-
-  return getChargeTextCandidates(charge).some((value) => {
-    const normalized = normalizeLookupKey(value);
-    return targets.some((target) => normalized.includes(target));
-  });
-}
-
-function isEngagementPlanCharge(charge: Record<string, unknown>): boolean {
-  return getChargeTextCandidates(charge).some((value) =>
-    normalizeLookupKey(value).includes('engagementplan')
-  );
-}
-
-function mapChargeToRecurringFrequency(charge: Record<string, unknown>): string | null {
-  const billingPeriodNormalized = normalizeLookupKey(asNonEmptyString(charge.billingPeriod) ?? '');
-
-  // Opensense package products should always be annual.
+function mapChargeToRecurringFrequency(charge: Record<string, unknown>, termMonths: number): string | null {
   if (isOpensensePackageCharge(charge)) {
     return 'annually';
   }
 
-  // Platform license discounts should be monthly.
-  if (isPlatformLicenseDiscountCharge(charge)) {
-    return 'monthly';
+  const pricePeriodRaw = asNonEmptyString(charge.pricePeriod) ?? asNonEmptyString(charge.billingPeriod);
+  const pricePeriod = normalizeLookupKey(pricePeriodRaw ?? '');
+
+  if (!pricePeriod) {
+    return null;
   }
 
-  // Engagement Plan variants should always be monthly.
-  if (isEngagementPlanCharge(charge)) {
+  if (pricePeriod === 'monthly') {
     return 'monthly';
   }
-
-  // Override with billingPeriod for explicitly non-monthly/annual cadences.
-  if (billingPeriodNormalized === 'quarterly') {
+  if (pricePeriod === 'quarterly') {
     return 'quarterly';
   }
-  if (billingPeriodNormalized === 'biannual' || billingPeriodNormalized === 'semiannually') {
+  if (pricePeriod === 'biannual' || pricePeriod === 'semiannually') {
     return 'per_six_months';
   }
+  if (pricePeriod === 'annual' || pricePeriod === 'annually') {
+    return 'annually';
+  }
+  if (pricePeriod === 'weekly') {
+    return 'weekly';
+  }
+  if (pricePeriod === 'everytwoweeks' || pricePeriod === 'biweekly') {
+    return 'biweekly';
+  }
+  if (pricePeriod === 'endofterm') {
+    if (termMonths >= 60) {
+      return 'per_five_years';
+    }
+    if (termMonths >= 48) {
+      return 'per_four_years';
+    }
+    if (termMonths >= 36) {
+      return 'per_three_years';
+    }
+    if (termMonths >= 24) {
+      return 'per_two_years';
+    }
 
-  const productOverride = mapProductOverrideToRecurringFrequency(charge);
-  if (productOverride) {
-    return productOverride;
+    return 'annually';
   }
 
-  return mapBillingPeriodToRecurringFrequency(charge.billingPeriod);
+  return null;
 }
 
-function mapRecurringFrequencyToYouniumBillingPeriod(
-  recurringFrequency: string,
-  sourceBillingPeriod: unknown
-): string {
-  const sourceNormalized = normalizeLookupKey(asNonEmptyString(sourceBillingPeriod) ?? '');
-  if (sourceNormalized === 'endofterm') {
-    return 'endOfTerm';
+function mapChargeToYouniumBillingPeriod(charge: Record<string, unknown>): string {
+  if (isOpensensePackageCharge(charge)) {
+    return 'annual';
   }
 
-  if (recurringFrequency === 'monthly') {
+  const pricePeriodRaw = asNonEmptyString(charge.pricePeriod) ?? asNonEmptyString(charge.billingPeriod);
+  const normalized = normalizeLookupKey(pricePeriodRaw ?? '');
+
+  if (normalized === 'monthly') {
     return 'monthly';
   }
-  if (recurringFrequency === 'quarterly') {
+  if (normalized === 'quarterly') {
     return 'quarterly';
   }
-  if (recurringFrequency === 'per_six_months') {
+  if (normalized === 'biannual' || normalized === 'semiannually') {
     return 'biannual';
+  }
+  if (normalized === 'endofterm') {
+    return 'endOfTerm';
   }
 
   return 'annual';
 }
 
-function mapChargeToYouniumChargeType(chargeName: string): string {
+function mapChargeToYouniumChargeModel(charge: Record<string, unknown>): string {
+  const priceModel = normalizeLookupKey(asNonEmptyString(charge.priceModel) ?? '');
+  return priceModel === 'quantity' ? 'quantity' : 'flat';
+}
+
+function mapChargeToYouniumChargeType(charge: Record<string, unknown>, chargeName: string): string {
+  const chargeType = normalizeLookupKey(asNonEmptyString(charge.chargeType) ?? '');
+  if (chargeType === 'oneoff' || chargeType === 'onetime') {
+    return 'OneOff';
+  }
+  if (chargeType === 'recurring') {
+    return 'recurring';
+  }
+
   return /one[\s-]?time/i.test(chargeName) ? 'OneOff' : 'recurring';
 }
 
@@ -774,7 +663,7 @@ function buildLineItemProperties(
   const rawQuantity = asFiniteNumber(charge.quantity) ?? 1;
   const quantity = rawQuantity > 0 ? rawQuantity : 1;
   const unitPrice = findUnitPrice(charge);
-  const recurringBillingFrequency = mapChargeToRecurringFrequency(charge);
+  const recurringBillingFrequency = mapChargeToRecurringFrequency(charge, termMonths);
 
   if (!chargeId) {
     return {
@@ -798,21 +687,19 @@ function buildLineItemProperties(
   }
 
   if (!recurringBillingFrequency) {
-    const billingPeriod = asNonEmptyString(charge.billingPeriod) ?? '<missing>';
+    const pricePeriod = asNonEmptyString(charge.pricePeriod) ?? asNonEmptyString(charge.billingPeriod) ?? '<missing>';
     return {
       ok: false,
-      message: `Unsupported billingPeriod "${billingPeriod}" for charge ${chargeId}`
+      message: `Unsupported pricePeriod "${pricePeriod}" for charge ${chargeId}`
     };
   }
   const isOpensensePackage = isOpensensePackageCharge(charge);
   const annualizedPackagePrice =
     isOpensensePackage && recurringBillingFrequency === 'annually' ? unitPrice * 12 : unitPrice;
   const unitPricePerQuantity = isOpensensePackage ? annualizedPackagePrice : unitPrice / quantity;
-  const youniumBillingPeriod = mapRecurringFrequencyToYouniumBillingPeriod(
-    recurringBillingFrequency,
-    charge.billingPeriod
-  );
-  const youniumChargeType = mapChargeToYouniumChargeType(chargeName);
+  const youniumBillingPeriod = mapChargeToYouniumBillingPeriod(charge);
+  const youniumChargeType = mapChargeToYouniumChargeType(charge, chargeName);
+  const youniumChargeModel = mapChargeToYouniumChargeModel(charge);
 
   const normalizedUnitPrice = unitPricePerQuantity < 0 ? 0 : unitPricePerQuantity;
   const unitDiscount = unitPricePerQuantity < 0 ? Math.abs(unitPricePerQuantity) : null;
@@ -824,7 +711,7 @@ function buildLineItemProperties(
     hs_recurring_billing_period: toHubspotRecurringBillingPeriod(termMonths),
     recurringbillingfrequency: recurringBillingFrequency,
     younium_billing_period: youniumBillingPeriod,
-    younium_charge_model: 'flat',
+    younium_charge_model: youniumChargeModel,
     younium_charge_type: youniumChargeType,
     [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_START_DATE_PROP]: forecastStartMs,
     [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_END_DATE_PROP]: forecastEndYmd,
@@ -1176,17 +1063,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
       auth: { persistSession: false }
     });
 
-    const { data: readyRowsData, error: readyRowsError } = await supabase
+    let readyRowsQuery = supabase
       .from('renewals_ready_for_hubspot')
       .select('subscription_id,term_end_date,source_hubspot_deal_id,younium_charges_json')
-      .order('term_end_date', { ascending: true })
-      .limit(requestOptions.limit);
+      .order('term_end_date', { ascending: true });
+
+    if (requestOptions.limit != null) {
+      readyRowsQuery = readyRowsQuery.limit(requestOptions.limit);
+    }
+
+    const { data: readyRowsData, error: readyRowsError } = await readyRowsQuery;
 
     if (readyRowsError) {
       throw new Error(`Failed to query renewals_ready_for_hubspot: ${readyRowsError.message}`);
     }
 
-    const readyRows = ((readyRowsData ?? []) as ReadyRow[]).slice(0, requestOptions.limit);
+    const readyRows = (readyRowsData ?? []) as ReadyRow[];
 
     let created = 0;
     let errors = 0;
@@ -1505,7 +1397,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
 
     return jsonResponse(200, {
-      requested_limit: requestOptions.limit,
+      requested_limit: requestOptions.limit ?? 'all',
       processed: readyRows.length,
       created,
       errors,
