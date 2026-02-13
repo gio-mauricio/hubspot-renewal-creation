@@ -88,6 +88,54 @@ const REQUIRED_LINE_ITEM_PROPERTY_ENV_NAMES = [
   'HS_LI_YOUNIUM_ORDER_CHARGE_ID_PROP'
 ] as const;
 
+const DIRECT_COPY_FIELDS = [
+  'billing_contact_name',
+  'billing_title',
+  'billing_phone',
+  'billing_email',
+  'billing_notes',
+  'younium_remarks',
+  'younium_order_number',
+  'younium_owner',
+  'deal_company_domain'
+] as const;
+
+const SELECT_COPY_FIELDS = [
+  'renewal_billing_status',
+  'deal_term',
+  'payment_frequency',
+  'payment_terms',
+  'autorenew'
+] as const;
+
+const MULTISELECT_COPY_FIELDS = [
+  'crm_',
+  'custom_directory',
+  'email_server_',
+  'marketing_automation_system_multi_select',
+  'security_software',
+  'sso_'
+] as const;
+
+const SOURCE_DEAL_PROPERTIES = [
+  'dealname',
+  'dealstage',
+  'pipeline',
+  'amount',
+  'closedate',
+  'hubspot_owner_id',
+  'cs_owner_2',
+  ...DIRECT_COPY_FIELDS,
+  ...SELECT_COPY_FIELDS,
+  ...MULTISELECT_COPY_FIELDS,
+  'contract_start_date__c',
+  'contract_end_date__c',
+  'younium_order_effective_start_date',
+  'younium_order_effective_change_date',
+  'younium_initial_term',
+  'younium_renewal_term'
+] as const;
+
 function jsonResponse(status: number, payload: Record<string, unknown>): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -136,7 +184,23 @@ function asFiniteNumber(value: unknown): number | null {
   return null;
 }
 
-const DAY_IN_MS = 24 * 60 * 60 * 1000;
+function getPropertyString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+
+  return null;
+}
 
 function parseIsoDateToUtcDate(value: string, fieldName: string): Date {
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -162,6 +226,22 @@ function parseIsoDateToUtcDate(value: string, fieldName: string): Date {
 
 function parseDateLikeToUtcDate(value: string, fieldName: string): Date {
   const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const ms = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(ms)) {
+      throw new Error(`Invalid ${fieldName}: ${value}`);
+    }
+
+    const parsedDate = new Date(ms);
+    if (!Number.isFinite(parsedDate.getTime())) {
+      throw new Error(`Invalid ${fieldName}: ${value}`);
+    }
+
+    return new Date(
+      Date.UTC(parsedDate.getUTCFullYear(), parsedDate.getUTCMonth(), parsedDate.getUTCDate())
+    );
+  }
+
   const isoPrefixMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (isoPrefixMatch) {
     return parseIsoDateToUtcDate(
@@ -187,6 +267,16 @@ function addUtcDays(date: Date, days: number): Date {
   return next;
 }
 
+function addUtcMonths(date: Date, months: number): Date {
+  const targetMonthStart = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1));
+  const lastDayInTargetMonth = new Date(
+    Date.UTC(targetMonthStart.getUTCFullYear(), targetMonthStart.getUTCMonth() + 1, 0)
+  ).getUTCDate();
+  const day = Math.min(date.getUTCDate(), lastDayInTargetMonth);
+
+  return new Date(Date.UTC(targetMonthStart.getUTCFullYear(), targetMonthStart.getUTCMonth(), day));
+}
+
 function formatUtcDateYYYYMMDD(date: Date): string {
   const yyyy = String(date.getUTCFullYear());
   const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -199,27 +289,6 @@ function formatUtcDateMMDDYYYY(date: Date): string {
   const dd = String(date.getUTCDate()).padStart(2, '0');
   const yyyy = String(date.getUTCFullYear());
   return `${mm}/${dd}/${yyyy}`;
-}
-
-function dateLikeToEpochMsString(input: string, fieldName: string): string {
-  const value = input.trim();
-  let normalized = value;
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    normalized = `${value}T00:00:00.000Z`;
-  } else if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {
-    const hasTimezone = /([zZ]|[+\-]\d{2}:\d{2})$/.test(value);
-    if (!hasTimezone) {
-      normalized = `${value}Z`;
-    }
-  }
-
-  const ms = Date.parse(normalized);
-  if (!Number.isFinite(ms)) {
-    throw new Error(`Invalid ${fieldName}: ${input}`);
-  }
-
-  return String(ms);
 }
 
 function extractHubSpotMessage(body: unknown, fallback: string): string {
@@ -298,10 +367,61 @@ function termEndDateToEpochMs(termEndDate: string): string {
   return String(ms);
 }
 
-function forecastStartDateFromTermEnd(termEndDate: string): string {
-  const termEnd = parseIsoDateToUtcDate(termEndDate, 'term_end_date');
-  const forecastStart = addUtcDays(termEnd, 1);
-  return formatUtcDateMMDDYYYY(forecastStart);
+function getTermMonthsFromDealTerm(dealTermRaw: string | null): number {
+  if (!dealTermRaw) {
+    return 12;
+  }
+
+  const normalized = dealTermRaw.toLowerCase().replace(/[\s_-]+/g, '');
+  if (normalized === '2year') {
+    return 24;
+  }
+  if (normalized === '3year') {
+    return 36;
+  }
+
+  return 12;
+}
+
+function calculateForecastDates(
+  sourceProperties: SourceDealProperties,
+  row: ReadyRow
+): {
+  forecastStart: Date;
+  forecastEnd: Date;
+  termMonths: number;
+} {
+  const termMonths = getTermMonthsFromDealTerm(asNonEmptyString(sourceProperties.deal_term));
+
+  const sourceYouniumStartRaw = getPropertyString(sourceProperties, 'younium_order_effective_start_date');
+  const sourceContractEndRaw = getPropertyString(sourceProperties, 'contract_end_date__c');
+
+  let forecastStart: Date;
+
+  if (sourceYouniumStartRaw) {
+    const sourceYouniumStart = parseDateLikeToUtcDate(
+      sourceYouniumStartRaw,
+      'source younium_order_effective_start_date'
+    );
+    forecastStart = addUtcMonths(sourceYouniumStart, termMonths);
+  } else if (sourceContractEndRaw) {
+    const sourceContractEnd = parseDateLikeToUtcDate(
+      sourceContractEndRaw,
+      'source contract_end_date__c'
+    );
+    forecastStart = addUtcDays(sourceContractEnd, 1);
+  } else {
+    const ledgerTermEnd = parseIsoDateToUtcDate(row.term_end_date, 'term_end_date');
+    forecastStart = addUtcDays(ledgerTermEnd, 1);
+  }
+
+  const forecastEnd = addUtcDays(addUtcMonths(forecastStart, termMonths), -1);
+
+  return {
+    forecastStart,
+    forecastEnd,
+    termMonths
+  };
 }
 
 function loadConfig(): RuntimeConfig {
@@ -374,7 +494,15 @@ function isRecurringAndNotCancelled(charge: Record<string, unknown>): boolean {
   const chargeType = asNonEmptyString(charge.chargeType)?.toLowerCase();
   const changeState = asNonEmptyString(charge.changeState)?.toLowerCase();
 
-  return chargeType === 'recurring' && changeState !== 'cancelled';
+  if (chargeType !== 'recurring') {
+    return false;
+  }
+
+  if (!changeState) {
+    return false;
+  }
+
+  return changeState === 'new' || changeState === 'notchanged' || changeState === 'newfromchange';
 }
 
 function findUnitPrice(charge: Record<string, unknown>): number | null {
@@ -533,8 +661,57 @@ function mapProductOverrideToRecurringFrequency(charge: Record<string, unknown>)
   return null;
 }
 
+function getChargeTextCandidates(charge: Record<string, unknown>): string[] {
+  return [
+    asNonEmptyString(charge.name),
+    asNonEmptyString(charge.productName),
+    getNestedString(charge, 'product')
+  ].filter((value): value is string => Boolean(value));
+}
+
+function isOpensensePackageCharge(charge: Record<string, unknown>): boolean {
+  const targets = new Set([
+    'opensensesignaturepackage',
+    'opensensepipelinepackage',
+    'opensensecompletepackage',
+    'opensenseengagementpackage'
+  ]);
+
+  return getChargeTextCandidates(charge).some((value) => targets.has(normalizeLookupKey(value)));
+}
+
+function isPlatformLicenseDiscountCharge(charge: Record<string, unknown>): boolean {
+  const targets = ['discountplatformlicense', 'discountlegacyplatformlicense'];
+
+  return getChargeTextCandidates(charge).some((value) => {
+    const normalized = normalizeLookupKey(value);
+    return targets.some((target) => normalized.includes(target));
+  });
+}
+
+function isEngagementPlanCharge(charge: Record<string, unknown>): boolean {
+  return getChargeTextCandidates(charge).some((value) =>
+    normalizeLookupKey(value).includes('engagementplan')
+  );
+}
+
 function mapChargeToRecurringFrequency(charge: Record<string, unknown>): string | null {
   const billingPeriodNormalized = normalizeLookupKey(asNonEmptyString(charge.billingPeriod) ?? '');
+
+  // Opensense package products should always be annual.
+  if (isOpensensePackageCharge(charge)) {
+    return 'annually';
+  }
+
+  // Platform license discounts should be monthly.
+  if (isPlatformLicenseDiscountCharge(charge)) {
+    return 'monthly';
+  }
+
+  // Engagement Plan variants should always be monthly.
+  if (isEngagementPlanCharge(charge)) {
+    return 'monthly';
+  }
 
   // Override with billingPeriod for explicitly non-monthly/annual cadences.
   if (billingPeriodNormalized === 'quarterly') {
@@ -552,11 +729,43 @@ function mapChargeToRecurringFrequency(charge: Record<string, unknown>): string 
   return mapBillingPeriodToRecurringFrequency(charge.billingPeriod);
 }
 
+function mapRecurringFrequencyToYouniumBillingPeriod(
+  recurringFrequency: string,
+  sourceBillingPeriod: unknown
+): string {
+  const sourceNormalized = normalizeLookupKey(asNonEmptyString(sourceBillingPeriod) ?? '');
+  if (sourceNormalized === 'endofterm') {
+    return 'endOfTerm';
+  }
+
+  if (recurringFrequency === 'monthly') {
+    return 'monthly';
+  }
+  if (recurringFrequency === 'quarterly') {
+    return 'quarterly';
+  }
+  if (recurringFrequency === 'per_six_months') {
+    return 'biannual';
+  }
+
+  return 'annual';
+}
+
+function mapChargeToYouniumChargeType(chargeName: string): string {
+  return /one[\s-]?time/i.test(chargeName) ? 'OneOff' : 'recurring';
+}
+
+function toHubspotRecurringBillingPeriod(termMonths: number): string {
+  return `P${Math.max(1, Math.floor(termMonths))}M`;
+}
+
 function buildLineItemProperties(
   charge: Record<string, unknown>,
-  row: ReadyRow,
   lineItemPropNames: Record<string, string>,
-  fingerprint: string
+  fingerprint: string,
+  forecastStartMs: string,
+  forecastEndYmd: string,
+  termMonths: number
 ): ChargeBuildResult {
   const chargeId = asNonEmptyString(charge.chargeId) ?? asNonEmptyString(charge.id);
   const orderChargeId = asNonEmptyString(charge.id);
@@ -565,8 +774,6 @@ function buildLineItemProperties(
   const rawQuantity = asFiniteNumber(charge.quantity) ?? 1;
   const quantity = rawQuantity > 0 ? rawQuantity : 1;
   const unitPrice = findUnitPrice(charge);
-  const effectiveStartDate = asNonEmptyString(charge.effectiveStartDate);
-  const effectiveEndDate = asNonEmptyString(charge.effectiveEndDate);
   const recurringBillingFrequency = mapChargeToRecurringFrequency(charge);
 
   if (!chargeId) {
@@ -590,13 +797,6 @@ function buildLineItemProperties(
     };
   }
 
-  if (!effectiveStartDate) {
-    return {
-      ok: false,
-      message: `Missing effectiveStartDate for charge ${chargeId}`
-    };
-  }
-
   if (!recurringBillingFrequency) {
     const billingPeriod = asNonEmptyString(charge.billingPeriod) ?? '<missing>';
     return {
@@ -604,43 +804,15 @@ function buildLineItemProperties(
       message: `Unsupported billingPeriod "${billingPeriod}" for charge ${chargeId}`
     };
   }
-
-  const sourceStartDate = parseDateLikeToUtcDate(
-    effectiveStartDate,
-    `effectiveStartDate for charge ${chargeId}`
+  const isOpensensePackage = isOpensensePackageCharge(charge);
+  const annualizedPackagePrice =
+    isOpensensePackage && recurringBillingFrequency === 'annually' ? unitPrice * 12 : unitPrice;
+  const unitPricePerQuantity = isOpensensePackage ? annualizedPackagePrice : unitPrice / quantity;
+  const youniumBillingPeriod = mapRecurringFrequencyToYouniumBillingPeriod(
+    recurringBillingFrequency,
+    charge.billingPeriod
   );
-  const forecastStartDate = addUtcDays(parseIsoDateToUtcDate(row.term_end_date, 'term_end_date'), 1);
-
-  let forecastEndDate: Date;
-  if (effectiveEndDate) {
-    const sourceEndDate = parseDateLikeToUtcDate(
-      effectiveEndDate,
-      `effectiveEndDate for charge ${chargeId}`
-    );
-
-    if (sourceEndDate.getTime() < sourceStartDate.getTime()) {
-      return {
-        ok: false,
-        message: `effectiveEndDate is before effectiveStartDate for charge ${chargeId}`
-      };
-    }
-
-    const durationDays = Math.floor((sourceEndDate.getTime() - sourceStartDate.getTime()) / DAY_IN_MS) + 1;
-    forecastEndDate = addUtcDays(forecastStartDate, Math.max(durationDays - 1, 0));
-  } else {
-    const annualEnd = new Date(
-      Date.UTC(
-        forecastStartDate.getUTCFullYear() + 1,
-        forecastStartDate.getUTCMonth(),
-        forecastStartDate.getUTCDate()
-      )
-    );
-    forecastEndDate = addUtcDays(annualEnd, -1);
-  }
-
-  const effectiveStartDateMs = String(forecastStartDate.getTime());
-  const forecastEndDateYmd = formatUtcDateYYYYMMDD(forecastEndDate);
-  const unitPricePerQuantity = unitPrice / quantity;
+  const youniumChargeType = mapChargeToYouniumChargeType(chargeName);
 
   const normalizedUnitPrice = unitPricePerQuantity < 0 ? 0 : unitPricePerQuantity;
   const unitDiscount = unitPricePerQuantity < 0 ? Math.abs(unitPricePerQuantity) : null;
@@ -649,9 +821,13 @@ function buildLineItemProperties(
     name: chargeName,
     quantity: String(quantity),
     price: String(normalizedUnitPrice),
+    hs_recurring_billing_period: toHubspotRecurringBillingPeriod(termMonths),
     recurringbillingfrequency: recurringBillingFrequency,
-    [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_START_DATE_PROP]: effectiveStartDateMs,
-    [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_END_DATE_PROP]: forecastEndDateYmd,
+    younium_billing_period: youniumBillingPeriod,
+    younium_charge_model: 'flat',
+    younium_charge_type: youniumChargeType,
+    [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_START_DATE_PROP]: forecastStartMs,
+    [lineItemPropNames.HS_LI_YOUNIUM_CHARGE_EFFECTIVE_END_DATE_PROP]: forecastEndYmd,
     [lineItemPropNames.HS_LI_YOUNIUM_LINE_ITEM_STATUS_PROP]: 'Existing',
     [lineItemPropNames.HS_LI_YOUNIUM_ORDER_PRODUCT_CHARGE_PROP]: chargeNumber,
     [lineItemPropNames.HS_LI_YOUNIUM_START_ON_PROP]: 'alignToOrder',
@@ -844,9 +1020,12 @@ async function processLineItemsForRow(params: {
   lineItemPropNames: Record<string, string>;
   row: ReadyRow;
   createdDealId: string;
+  forecastStartMs: string;
+  forecastEndYmd: string;
+  termMonths: number;
   dryRun: boolean;
 }): Promise<LineItemRunSummary> {
-  const { config, lineItemPropNames, row, createdDealId, dryRun } = params;
+  const { config, lineItemPropNames, row, createdDealId, forecastStartMs, forecastEndYmd, termMonths, dryRun } = params;
 
   const allCharges = parseCharges(row.younium_charges_json);
   const charges = allCharges.filter(isRecurringAndNotCancelled);
@@ -882,14 +1061,22 @@ async function processLineItemsForRow(params: {
       asNonEmptyString(charge.chargeId) ??
       asNonEmptyString(charge.id) ??
       asNonEmptyString(charge.chargeNumber);
+    const orderChargeIdentifier = asNonEmptyString(charge.id);
 
     if (!chargeIdentifier) {
       pushError('Skipping charge with missing chargeId/id/chargeNumber for fingerprint');
       continue;
     }
 
-    const fingerprint = `${row.subscription_id}:${row.term_end_date}:${chargeIdentifier}`;
-    const buildResult = buildLineItemProperties(charge, row, lineItemPropNames, fingerprint);
+    const fingerprint = `${row.subscription_id}:${row.term_end_date}:${chargeIdentifier}:${orderChargeIdentifier ?? 'no-order-charge-id'}`;
+    const buildResult = buildLineItemProperties(
+      charge,
+      lineItemPropNames,
+      fingerprint,
+      forecastStartMs,
+      forecastEndYmd,
+      termMonths
+    );
 
     if (!buildResult.ok) {
       pushError(buildResult.message);
@@ -1020,10 +1207,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
       try {
         const sourceDealUrl = new URL(`https://api.hubapi.com/crm/v3/objects/deals/${encodeURIComponent(row.source_hubspot_deal_id)}`);
-        sourceDealUrl.searchParams.set(
-          'properties',
-          'dealname,dealstage,pipeline,amount,closedate,hubspot_owner_id'
-        );
+        sourceDealUrl.searchParams.set('properties', SOURCE_DEAL_PROPERTIES.join(','));
 
         const sourceDealResponse = await fetch(sourceDealUrl.toString(), {
           method: 'GET',
@@ -1078,11 +1262,18 @@ Deno.serve(async (req: Request): Promise<Response> => {
             ? (sourceDealBody.properties as SourceDealProperties)
             : {};
 
-        const sourceOwnerId = asNonEmptyString(sourceProperties.hubspot_owner_id);
+        const sourceDealId =
+          isRecord(sourceDealBody)
+            ? asNonEmptyString(sourceDealBody.id)
+            : null;
 
+        const { forecastStart, forecastEnd, termMonths } = calculateForecastDates(sourceProperties, row);
         const closedateMs = termEndDateToEpochMs(row.term_end_date);
-        const forecastContractStartDate = forecastStartDateFromTermEnd(row.term_end_date);
+        const forecastContractStartDate = formatUtcDateMMDDYYYY(forecastStart);
         const renewalDealName = `{COMPANY DOMAIN} Renewal ${forecastContractStartDate}`;
+        const forecastStartMs = String(forecastStart.getTime());
+        const forecastEndMs = String(forecastEnd.getTime());
+        const forecastEndYmd = formatUtcDateYYYYMMDD(forecastEnd);
 
         const dealCreatePayload: Record<string, string> = {
           dealname: renewalDealName,
@@ -1091,8 +1282,40 @@ Deno.serve(async (req: Request): Promise<Response> => {
           closedate: closedateMs
         };
 
-        if (sourceOwnerId) {
-          dealCreatePayload.hubspot_owner_id = sourceOwnerId;
+        // Owner assignment intentionally disabled during testing to avoid notifying reps.
+
+        for (const field of DIRECT_COPY_FIELDS) {
+          const value = getPropertyString(sourceProperties, field);
+          if (value) {
+            dealCreatePayload[field] = value;
+          }
+        }
+
+        for (const field of SELECT_COPY_FIELDS) {
+          const value = getPropertyString(sourceProperties, field);
+          if (value) {
+            dealCreatePayload[field] = value;
+          }
+        }
+
+        for (const field of MULTISELECT_COPY_FIELDS) {
+          const value = getPropertyString(sourceProperties, field);
+          if (value) {
+            dealCreatePayload[field] = value;
+          }
+        }
+
+        // Forecast overrides
+        dealCreatePayload.dealtype = 'existingbusiness';
+        dealCreatePayload.younium_change_type = 'change';
+        dealCreatePayload.contract_start_date__c = forecastStartMs;
+        dealCreatePayload.contract_end_date__c = forecastEndMs;
+        dealCreatePayload.younium_order_effective_start_date = forecastStartMs;
+        dealCreatePayload.younium_order_effective_change_date = forecastEndMs;
+        dealCreatePayload.younium_initial_term = String(termMonths);
+        dealCreatePayload.younium_renewal_term = String(termMonths);
+        if (sourceDealId) {
+          dealCreatePayload.original_deal_id = sourceDealId;
         }
 
         if (requestOptions.dryRun) {
@@ -1104,6 +1327,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
               lineItemPropNames: lineItemPropNames as Record<string, string>,
               row,
               createdDealId: 'dry-run',
+              forecastStartMs,
+              forecastEndYmd,
+              termMonths,
               dryRun: true
             });
 
@@ -1194,6 +1420,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
             lineItemPropNames: lineItemPropNames as Record<string, string>,
             row,
             createdDealId,
+            forecastStartMs,
+            forecastEndYmd,
+            termMonths,
             dryRun: false
           });
 
