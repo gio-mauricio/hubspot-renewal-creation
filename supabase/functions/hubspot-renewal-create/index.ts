@@ -1,6 +1,11 @@
 /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  safeFinishAutomationRun,
+  safeInsertAutomationEvents,
+  safeStartAutomationRun
+} from '../_shared/opsLogger.ts';
 
 type RuntimeConfig = {
   ingestSecret: string;
@@ -1086,9 +1091,27 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
+  let supabase: ReturnType<typeof createClient> | null = null;
+  let runId: string | null = null;
+  let processedCount = 0;
+  let created = 0;
+  let errors = 0;
+  let results: RowResult[] = [];
+
   try {
-    const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
+    supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
       auth: { persistSession: false }
+    });
+    runId = await safeStartAutomationRun(supabase, {
+      functionName: 'hubspot-renewal-create',
+      triggerSource: requestOptions.sourceHubspotDealId ? 'webhook' : 'cron',
+      runMode: config.runMode,
+      sourceHubspotDealId: requestOptions.sourceHubspotDealId,
+      metadata: {
+        dry_run: requestOptions.dryRun,
+        create_line_items: requestOptions.createLineItems,
+        requested_limit: requestOptions.limit ?? 'all'
+      }
     });
 
     let readyRowsQuery = supabase
@@ -1111,10 +1134,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
 
     const readyRows = (readyRowsData ?? []) as ReadyRow[];
-
-    let created = 0;
-    let errors = 0;
-    const results: RowResult[] = [];
+    processedCount = readyRows.length;
 
     for (const row of readyRows) {
       const resultBase = {
@@ -1428,10 +1448,51 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
     }
 
+    await safeInsertAutomationEvents(supabase, [
+      {
+        runId,
+        functionName: 'hubspot-renewal-create',
+        eventType: 'create_summary',
+        status: errors > 0 ? 'partial' : 'success',
+        sourceHubspotDealId: requestOptions.sourceHubspotDealId,
+        detail: {
+          dry_run: requestOptions.dryRun,
+          create_line_items: requestOptions.createLineItems,
+          requested_limit: requestOptions.limit ?? 'all',
+          processed: processedCount,
+          created,
+          errors,
+          error_samples: results
+            .filter((row) => Boolean(row.error))
+            .slice(0, 10)
+            .map((row) => ({
+              subscription_id: row.subscription_id,
+              term_end_date: row.term_end_date,
+              source_hubspot_deal_id: row.source_hubspot_deal_id,
+              error: row.error
+            }))
+        }
+      }
+    ]);
+    await safeFinishAutomationRun(supabase, {
+      runId,
+      status: errors > 0 ? 'partial' : 'success',
+      httpStatus: 200,
+      processedCount,
+      createdCount: created,
+      errorCount: errors,
+      metadata: {
+        dry_run: requestOptions.dryRun,
+        create_line_items: requestOptions.createLineItems,
+        requested_limit: requestOptions.limit ?? 'all',
+        source_hubspot_deal_id: requestOptions.sourceHubspotDealId
+      }
+    });
+
     return jsonResponse(200, {
       requested_limit: requestOptions.limit ?? 'all',
       requested_source_hubspot_deal_id: requestOptions.sourceHubspotDealId,
-      processed: readyRows.length,
+      processed: processedCount,
       created,
       errors,
       results,
@@ -1439,6 +1500,43 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (supabase) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'hubspot-renewal-create',
+          eventType: 'run_failed',
+          status: 'error',
+          sourceHubspotDealId: requestOptions.sourceHubspotDealId,
+          detail: {
+            error: message,
+            dry_run: requestOptions.dryRun,
+            create_line_items: requestOptions.createLineItems,
+            requested_limit: requestOptions.limit ?? 'all',
+            processed: processedCount,
+            created,
+            errors
+          }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'error',
+        httpStatus: 500,
+        processedCount,
+        createdCount: created,
+        errorCount: Math.max(errors, 1),
+        errorMessage: message,
+        metadata: {
+          dry_run: requestOptions.dryRun,
+          create_line_items: requestOptions.createLineItems,
+          requested_limit: requestOptions.limit ?? 'all',
+          source_hubspot_deal_id: requestOptions.sourceHubspotDealId
+        }
+      });
+    }
+
     return jsonResponse(500, { error: message });
   }
 });

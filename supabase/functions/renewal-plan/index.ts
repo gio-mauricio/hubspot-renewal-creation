@@ -1,6 +1,11 @@
 /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  safeFinishAutomationRun,
+  safeInsertAutomationEvents,
+  safeStartAutomationRun
+} from '../_shared/opsLogger.ts';
 
 type RenewalCandidate = {
   subscription_id: string;
@@ -38,12 +43,21 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
+  let supabase: ReturnType<typeof createClient> | null = null;
+  let runId: string | null = null;
+  let candidatesFound = 0;
+  let plannedInserted = 0;
+
   try {
     const supabaseUrl = getRequiredEnv('SUPABASE_URL');
     const serviceRoleKey = getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
 
-    const supabase = createClient(supabaseUrl, serviceRoleKey, {
+    supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false }
+    });
+    runId = await safeStartAutomationRun(supabase, {
+      functionName: 'renewal-plan',
+      triggerSource: 'cron'
     });
 
     const { data: candidates, error: candidatesError } = await supabase
@@ -55,10 +69,27 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
 
     const candidateRows = (candidates ?? []) as RenewalCandidate[];
-    const candidatesFound = candidateRows.length;
+    candidatesFound = candidateRows.length;
     const timestamp = new Date().toISOString();
 
     if (candidatesFound === 0) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'renewal-plan',
+          eventType: 'no_candidates',
+          status: 'success',
+          detail: { candidates_found: 0 }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'success',
+        httpStatus: 200,
+        processedCount: 0,
+        createdCount: 0,
+        errorCount: 0
+      });
       return jsonResponse(200, {
         candidates_found: 0,
         planned_inserted: 0,
@@ -84,6 +115,23 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }));
 
     if (ledgerRows.length === 0) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'renewal-plan',
+          eventType: 'no_valid_candidates',
+          status: 'success',
+          detail: { candidates_found: candidatesFound }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'success',
+        httpStatus: 200,
+        processedCount: candidatesFound,
+        createdCount: 0,
+        errorCount: 0
+      });
       return jsonResponse(200, {
         candidates_found: candidatesFound,
         planned_inserted: 0,
@@ -102,14 +150,62 @@ Deno.serve(async (req: Request): Promise<Response> => {
     if (upsertError) {
       throw new Error(`Failed to write renewal ledger: ${upsertError.message}`);
     }
+    plannedInserted = (insertedRows ?? []).length;
+
+    await safeInsertAutomationEvents(supabase, [
+      {
+        runId,
+        functionName: 'renewal-plan',
+        eventType: 'planned_upsert_summary',
+        status: 'success',
+        detail: {
+          candidates_found: candidatesFound,
+          planned_inserted: plannedInserted
+        }
+      }
+    ]);
+    await safeFinishAutomationRun(supabase, {
+      runId,
+      status: 'success',
+      httpStatus: 200,
+      processedCount: candidatesFound,
+      createdCount: plannedInserted,
+      errorCount: 0
+    });
 
     return jsonResponse(200, {
       candidates_found: candidatesFound,
-      planned_inserted: (insertedRows ?? []).length,
+      planned_inserted: plannedInserted,
       timestamp
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (supabase) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'renewal-plan',
+          eventType: 'run_failed',
+          status: 'error',
+          detail: {
+            error: message,
+            candidates_found: candidatesFound,
+            planned_inserted: plannedInserted
+          }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'error',
+        httpStatus: 500,
+        processedCount: candidatesFound,
+        createdCount: plannedInserted,
+        errorCount: 1,
+        errorMessage: message
+      });
+    }
+
     return jsonResponse(500, { error: message });
   }
 });

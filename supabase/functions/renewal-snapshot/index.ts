@@ -1,6 +1,11 @@
 /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  safeFinishAutomationRun,
+  safeInsertAutomationEvents,
+  safeStartAutomationRun
+} from '../_shared/opsLogger.ts';
 
 type RuntimeConfig = {
   ingestSecret: string;
@@ -459,15 +464,23 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return jsonResponse(400, { error: message });
   }
 
+  let supabase: ReturnType<typeof createClient> | null = null;
+  let runId: string | null = null;
+  let batchesProcessed = 0;
+  let processedRowsTotal = 0;
+  let snapshotsUpsertedTotal = 0;
+  let errorsTotal = 0;
+  const errorSamples: ErrorSample[] = [];
+
   try {
-    const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
+    supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
       auth: { persistSession: false }
     });
-
-    let batchesProcessed = 0;
-    let snapshotsUpsertedTotal = 0;
-    let errorsTotal = 0;
-    const errorSamples: ErrorSample[] = [];
+    runId = await safeStartAutomationRun(supabase, {
+      functionName: 'renewal-snapshot',
+      triggerSource: requestOptions.sourceHubspotDealId ? 'webhook' : 'cron',
+      sourceHubspotDealId: requestOptions.sourceHubspotDealId
+    });
 
     const addError = (row: LedgerRow, message: string): void => {
       errorsTotal += 1;
@@ -493,6 +506,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
 
       batchesProcessed += 1;
+      processedRowsTotal += fetchedBatchCount;
 
       const subscriptionIds = Array.from(new Set(ledgerBatch.map((row) => row.subscription_id)));
       const { data: subscriptionRowsData, error: subscriptionsError } = await supabase
@@ -567,6 +581,39 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
     }
 
+    await safeInsertAutomationEvents(supabase, [
+      {
+        runId,
+        functionName: 'renewal-snapshot',
+        eventType: 'snapshot_summary',
+        status: errorsTotal > 0 ? 'partial' : 'success',
+        sourceHubspotDealId: requestOptions.sourceHubspotDealId,
+        detail: {
+          batch_size: config.batchSize,
+          max_batches: config.maxBatches,
+          batches_processed: batchesProcessed,
+          processed_rows: processedRowsTotal,
+          snapshots_upserted: snapshotsUpsertedTotal,
+          errors: errorsTotal,
+          error_samples: errorSamples
+        }
+      }
+    ]);
+    await safeFinishAutomationRun(supabase, {
+      runId,
+      status: errorsTotal > 0 ? 'partial' : 'success',
+      httpStatus: 200,
+      processedCount: processedRowsTotal,
+      createdCount: snapshotsUpsertedTotal,
+      errorCount: errorsTotal,
+      metadata: {
+        batch_size: config.batchSize,
+        max_batches: config.maxBatches,
+        batches_processed: batchesProcessed,
+        source_hubspot_deal_id: requestOptions.sourceHubspotDealId
+      }
+    });
+
     return jsonResponse(200, {
       batch_size: config.batchSize,
       max_batches: config.maxBatches,
@@ -579,6 +626,44 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (supabase) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'renewal-snapshot',
+          eventType: 'run_failed',
+          status: 'error',
+          sourceHubspotDealId: requestOptions.sourceHubspotDealId,
+          detail: {
+            error: message,
+            batch_size: config.batchSize,
+            max_batches: config.maxBatches,
+            batches_processed: batchesProcessed,
+            processed_rows: processedRowsTotal,
+            snapshots_upserted: snapshotsUpsertedTotal,
+            errors: errorsTotal,
+            error_samples: errorSamples
+          }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'error',
+        httpStatus: 500,
+        processedCount: processedRowsTotal,
+        createdCount: snapshotsUpsertedTotal,
+        errorCount: Math.max(errorsTotal, 1),
+        errorMessage: message,
+        metadata: {
+          batch_size: config.batchSize,
+          max_batches: config.maxBatches,
+          batches_processed: batchesProcessed,
+          source_hubspot_deal_id: requestOptions.sourceHubspotDealId
+        }
+      });
+    }
+
     return jsonResponse(500, { error: message });
   }
 });

@@ -1,6 +1,11 @@
 /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  safeFinishAutomationRun,
+  safeInsertAutomationEvents,
+  safeStartAutomationRun
+} from '../_shared/opsLogger.ts';
 
 type YouniumSubscription = {
   id?: string;
@@ -244,18 +249,25 @@ Deno.serve(async (request: Request) => {
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
+  let supabase: ReturnType<typeof createClient> | null = null;
+  let runId: string | null = null;
+  let pages = 0;
+  let fetchedTotal = 0;
+  let activeTotal = 0;
+  let upsertedTotal = 0;
+
   try {
-    const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
+    supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
       auth: { persistSession: false }
+    });
+    runId = await safeStartAutomationRun(supabase, {
+      functionName: 'younium-ingest',
+      triggerSource: 'cron'
     });
 
     const accessToken = await getAccessToken(config);
 
     let pageNumber = 1;
-    let pages = 0;
-    let fetchedTotal = 0;
-    let activeTotal = 0;
-    let upsertedTotal = 0;
 
     while (true) {
       const subscriptions = await fetchSubscriptionsPage(config, accessToken, pageNumber);
@@ -297,6 +309,33 @@ Deno.serve(async (request: Request) => {
       pageNumber += 1;
     }
 
+    await safeInsertAutomationEvents(supabase, [
+      {
+        runId,
+        functionName: 'younium-ingest',
+        eventType: 'ingest_summary',
+        status: 'success',
+        detail: {
+          pages,
+          fetched_total: fetchedTotal,
+          active_total: activeTotal,
+          upserted_total: upsertedTotal
+        }
+      }
+    ]);
+    await safeFinishAutomationRun(supabase, {
+      runId,
+      status: 'success',
+      httpStatus: 200,
+      processedCount: fetchedTotal,
+      createdCount: upsertedTotal,
+      errorCount: 0,
+      metadata: {
+        pages,
+        active_total: activeTotal
+      }
+    });
+
     return jsonResponse(200, {
       pages,
       fetched_total: fetchedTotal,
@@ -305,6 +344,38 @@ Deno.serve(async (request: Request) => {
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (supabase) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'younium-ingest',
+          eventType: 'run_failed',
+          status: 'error',
+          detail: {
+            error: message,
+            pages,
+            fetched_total: fetchedTotal,
+            active_total: activeTotal,
+            upserted_total: upsertedTotal
+          }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'error',
+        httpStatus: 500,
+        processedCount: fetchedTotal,
+        createdCount: upsertedTotal,
+        errorCount: 1,
+        errorMessage: message,
+        metadata: {
+          pages,
+          active_total: activeTotal
+        }
+      });
+    }
+
     return jsonResponse(500, { error: message });
   }
 });

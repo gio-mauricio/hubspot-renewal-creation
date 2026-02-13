@@ -1,6 +1,11 @@
 /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  safeFinishAutomationRun,
+  safeInsertAutomationEvents,
+  safeStartAutomationRun
+} from '../_shared/opsLogger.ts';
 
 type RuntimeConfig = {
   ingestSecret: string;
@@ -749,28 +754,97 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   const sourceDealId = await parseIncomingDealId(req);
-  if (!sourceDealId) {
-    return jsonResponse(200, {
-      result: 'invalid_request',
-      message: 'Missing source_hubspot_deal_id in request body.',
-      timestamp: new Date().toISOString()
-    });
-  }
+
+  let supabase: ReturnType<typeof createClient> | null = null;
+  let runId: string | null = null;
 
   try {
-    const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
+    supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
       auth: { persistSession: false }
     });
+    runId = await safeStartAutomationRun(supabase, {
+      functionName: 'hubspot-renewal-enqueue',
+      triggerSource: 'webhook',
+      sourceHubspotDealId: sourceDealId
+    });
+
+    const respondWithLogging = async (params: {
+      httpStatus: number;
+      runStatus: 'success' | 'partial' | 'error';
+      eventType: string;
+      responsePayload: Record<string, unknown>;
+      detail: Record<string, unknown>;
+      processedCount?: number;
+      createdCount?: number;
+      errorCount?: number;
+      errorMessage?: string | null;
+    }): Promise<Response> => {
+      await safeInsertAutomationEvents(supabase as ReturnType<typeof createClient>, [
+        {
+          runId,
+          functionName: 'hubspot-renewal-enqueue',
+          eventType: params.eventType,
+          sourceHubspotDealId: sourceDealId,
+          status: params.runStatus,
+          detail: params.detail
+        }
+      ]);
+      await safeFinishAutomationRun(supabase as ReturnType<typeof createClient>, {
+        runId,
+        status: params.runStatus,
+        httpStatus: params.httpStatus,
+        processedCount: params.processedCount ?? 0,
+        createdCount: params.createdCount ?? 0,
+        errorCount: params.errorCount ?? 0,
+        errorMessage: params.errorMessage ?? null,
+        metadata: {
+          source_hubspot_deal_id: sourceDealId
+        }
+      });
+      return jsonResponse(params.httpStatus, params.responsePayload);
+    };
+
+    if (!sourceDealId) {
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'partial',
+        eventType: 'invalid_request',
+        processedCount: 0,
+        createdCount: 0,
+        errorCount: 1,
+        detail: {
+          result: 'invalid_request',
+          message: 'Missing source_hubspot_deal_id in request body.'
+        },
+        responsePayload: {
+          result: 'invalid_request',
+          message: 'Missing source_hubspot_deal_id in request body.',
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
 
     const sourceDeal = await fetchHubSpotDeal(config.hubspotToken, sourceDealId);
     const companyId = await fetchAssociatedCompanyId(config.hubspotToken, sourceDealId);
 
     if (!companyId) {
-      return jsonResponse(200, {
-        result: 'not_found',
-        message: 'No associated company found on source deal.',
-        source_hubspot_deal_id: sourceDealId,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'partial',
+        eventType: 'not_found_company',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 1,
+        detail: {
+          result: 'not_found',
+          message: 'No associated company found on source deal.'
+        },
+        responsePayload: {
+          result: 'not_found',
+          message: 'No associated company found on source deal.',
+          source_hubspot_deal_id: sourceDealId,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -781,12 +855,25 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
 
     if (!youniumCustId) {
-      return jsonResponse(200, {
-        result: 'not_found',
-        message: `Company is missing ${config.companyYouniumCustIdProperty}.`,
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'partial',
+        eventType: 'not_found_younium_custid',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 1,
+        detail: {
+          result: 'not_found',
+          company_id: companyId,
+          message: `Company is missing ${config.companyYouniumCustIdProperty}.`
+        },
+        responsePayload: {
+          result: 'not_found',
+          message: `Company is missing ${config.companyYouniumCustIdProperty}.`,
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -805,25 +892,52 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const selected = chooseSubscription(subscriptionRows, anchorDate);
 
     if (!selected || !selected.effective_end_date) {
-      return jsonResponse(200, {
-        result: 'not_found',
-        message: 'No matching Younium subscription found for this company account.',
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        younium_custid: youniumCustId,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'partial',
+        eventType: 'not_found_subscription',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 1,
+        detail: {
+          result: 'not_found',
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          message: 'No matching Younium subscription found for this company account.'
+        },
+        responsePayload: {
+          result: 'not_found',
+          message: 'No matching Younium subscription found for this company account.',
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
     const effectiveEndDate = parseDateLike(selected.effective_end_date);
     if (!effectiveEndDate) {
-      return jsonResponse(200, {
-        result: 'not_found',
-        message: 'Selected Younium subscription has an invalid effective_end_date.',
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        younium_custid: youniumCustId,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'partial',
+        eventType: 'invalid_subscription_date',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 1,
+        detail: {
+          result: 'not_found',
+          subscription_id: selected.subscription_id,
+          message: 'Selected Younium subscription has an invalid effective_end_date.'
+        },
+        responsePayload: {
+          result: 'not_found',
+          message: 'Selected Younium subscription has an invalid effective_end_date.',
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -832,31 +946,59 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const existingLedger = await loadLedgerRow(supabase, subscriptionId, termEndDate);
 
     if (existingLedger && asNonEmptyString(existingLedger.hubspot_deal_id)) {
-      return jsonResponse(200, {
-        result: 'already_created',
-        message: 'Renewal already exists. No duplicate was created.',
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        younium_custid: youniumCustId,
-        subscription_id: subscriptionId,
-        term_end_date: termEndDate,
-        existing_hubspot_deal_id: existingLedger.hubspot_deal_id ?? undefined,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'success',
+        eventType: 'already_created',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 0,
+        detail: {
+          result: 'already_created',
+          subscription_id: subscriptionId,
+          term_end_date: termEndDate,
+          existing_hubspot_deal_id: existingLedger.hubspot_deal_id
+        },
+        responsePayload: {
+          result: 'already_created',
+          message: 'Renewal already exists. No duplicate was created.',
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          subscription_id: subscriptionId,
+          term_end_date: termEndDate,
+          existing_hubspot_deal_id: existingLedger.hubspot_deal_id ?? undefined,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
     const existingCreatedBySource = await loadMostRecentCreatedBySourceDeal(supabase, sourceDealId);
     if (existingCreatedBySource && asNonEmptyString(existingCreatedBySource.hubspot_deal_id)) {
-      return jsonResponse(200, {
-        result: 'already_created',
-        message: 'Renewal already exists. No duplicate was created.',
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        younium_custid: youniumCustId,
-        subscription_id: existingCreatedBySource.subscription_id,
-        term_end_date: existingCreatedBySource.term_end_date,
-        existing_hubspot_deal_id: existingCreatedBySource.hubspot_deal_id ?? undefined,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'success',
+        eventType: 'already_created',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 0,
+        detail: {
+          result: 'already_created',
+          subscription_id: existingCreatedBySource.subscription_id,
+          term_end_date: existingCreatedBySource.term_end_date,
+          existing_hubspot_deal_id: existingCreatedBySource.hubspot_deal_id
+        },
+        responsePayload: {
+          result: 'already_created',
+          message: 'Renewal already exists. No duplicate was created.',
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          subscription_id: existingCreatedBySource.subscription_id,
+          term_end_date: existingCreatedBySource.term_end_date,
+          existing_hubspot_deal_id: existingCreatedBySource.hubspot_deal_id ?? undefined,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -869,16 +1011,31 @@ Deno.serve(async (req: Request): Promise<Response> => {
         hubspotDealId: existingHubspotDealId
       });
 
-      return jsonResponse(200, {
-        result: 'already_created',
-        message: 'Renewal already exists. No duplicate was created.',
-        source_hubspot_deal_id: sourceDealId,
-        company_id: companyId,
-        younium_custid: youniumCustId,
-        subscription_id: subscriptionId,
-        term_end_date: termEndDate,
-        existing_hubspot_deal_id: existingHubspotDealId,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'success',
+        eventType: 'already_created',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 0,
+        detail: {
+          result: 'already_created',
+          subscription_id: subscriptionId,
+          term_end_date: termEndDate,
+          existing_hubspot_deal_id: existingHubspotDealId,
+          sync_source: 'hubspot_search'
+        },
+        responsePayload: {
+          result: 'already_created',
+          message: 'Renewal already exists. No duplicate was created.',
+          source_hubspot_deal_id: sourceDealId,
+          company_id: companyId,
+          younium_custid: youniumCustId,
+          subscription_id: subscriptionId,
+          term_end_date: termEndDate,
+          existing_hubspot_deal_id: existingHubspotDealId,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -892,9 +1049,18 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
 
     if (result.result === 'already_created') {
-      return jsonResponse(200, {
-        ...result,
-        timestamp: new Date().toISOString()
+      return await respondWithLogging({
+        httpStatus: 200,
+        runStatus: 'success',
+        eventType: 'already_created',
+        processedCount: 1,
+        createdCount: 0,
+        errorCount: 0,
+        detail: result,
+        responsePayload: {
+          ...result,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -933,7 +1099,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       message = 'Renewal queued, but immediate creation hit an error. It will retry in scheduled automation.';
     }
 
-    return jsonResponse(200, {
+    const responsePayload = {
       ...result,
       message,
       immediate_run: {
@@ -947,9 +1113,50 @@ Deno.serve(async (req: Request): Promise<Response> => {
         created_deal_id: createdDealId
       },
       timestamp: new Date().toISOString()
+    };
+
+    return await respondWithLogging({
+      httpStatus: 200,
+      runStatus: createCall.status !== 200 || createErrors > 0 ? 'partial' : 'success',
+      eventType: 'enqueue_processed',
+      processedCount: 1,
+      createdCount,
+      errorCount: createCall.status !== 200 || createErrors > 0 ? Math.max(1, createErrors) : 0,
+      detail: {
+        result: result.result,
+        message,
+        immediate_run: responsePayload.immediate_run
+      },
+      responsePayload
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (supabase) {
+      await safeInsertAutomationEvents(supabase, [
+        {
+          runId,
+          functionName: 'hubspot-renewal-enqueue',
+          eventType: 'run_failed',
+          sourceHubspotDealId: sourceDealId,
+          status: 'error',
+          detail: { error: message }
+        }
+      ]);
+      await safeFinishAutomationRun(supabase, {
+        runId,
+        status: 'error',
+        httpStatus: 500,
+        processedCount: sourceDealId ? 1 : 0,
+        createdCount: 0,
+        errorCount: 1,
+        errorMessage: message,
+        metadata: {
+          source_hubspot_deal_id: sourceDealId
+        }
+      });
+    }
+
     return jsonResponse(500, {
       error: message,
       source_hubspot_deal_id: sourceDealId,
