@@ -2,3 +2,12 @@ project_id = "jgdbgllwwuiyoqsllcco"
 
 [functions.younium-ingest]
 verify_jwt = false
+
+[functions.renewal-plan]
+verify_jwt = false
+
+[functions.renewal-snapshot]
+verify_jwt = false
+
+[functions.hubspot-renewal-create]
+verify_jwt = false
