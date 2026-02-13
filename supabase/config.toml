@@ -11,3 +11,6 @@ verify_jwt = false
 
 [functions.hubspot-renewal-create]
 verify_jwt = false
+
+[functions.hubspot-renewal-enqueue]
+verify_jwt = false

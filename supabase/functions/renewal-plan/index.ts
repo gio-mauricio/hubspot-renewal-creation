@@ -22,12 +22,16 @@ function getRequiredEnv(name: string): string {
   return value;
 }
 
+function getIngestSecretFromHeaders(headers: Headers): string | null {
+  return headers.get('x-ingest-secret') ?? headers.get('x_ingest_secret');
+}
+
 Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
     return jsonResponse(405, { error: 'Method not allowed. Use POST.' });
   }
 
-  const providedSecret = req.headers.get('x-ingest-secret');
+  const providedSecret = getIngestSecretFromHeaders(req.headers);
   const expectedSecret = Deno.env.get('INGEST_SECRET');
 
   if (!providedSecret || !expectedSecret || providedSecret !== expectedSecret) {

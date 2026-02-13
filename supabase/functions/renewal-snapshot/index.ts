@@ -42,6 +42,10 @@ type ErrorSample = {
   message: string;
 };
 
+type RequestOptions = {
+  sourceHubspotDealId: string | null;
+};
+
 function jsonResponse(status: number, payload: Record<string, unknown>): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -86,8 +90,12 @@ function loadConfig(): RuntimeConfig {
   };
 }
 
+function getIngestSecretFromHeaders(headers: Headers): string | null {
+  return headers.get('x-ingest-secret') ?? headers.get('x_ingest_secret');
+}
+
 function isAuthorized(req: Request, expectedSecret: string): boolean {
-  const providedSecret = req.headers.get('x-ingest-secret');
+  const providedSecret = getIngestSecretFromHeaders(req.headers);
   return Boolean(providedSecret && providedSecret === expectedSecret);
 }
 
@@ -102,6 +110,19 @@ function asNonEmptyString(value: unknown): string | null {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function asDealIdString(value: unknown): string | null {
+  const fromString = asNonEmptyString(value);
+  if (fromString) {
+    return fromString;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return String(Math.trunc(value));
+  }
+
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -142,6 +163,34 @@ function parseArrayPayload(payload: unknown): unknown[] {
   }
 
   return [];
+}
+
+async function getRequestOptions(req: Request): Promise<RequestOptions> {
+  const text = await req.text();
+  if (!text.trim()) {
+    return { sourceHubspotDealId: null };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('Invalid JSON body');
+  }
+
+  if (!isRecord(parsed)) {
+    throw new Error('Invalid request body: expected JSON object');
+  }
+
+  const sourceHubspotDealId =
+    asDealIdString(parsed.source_hubspot_deal_id) ??
+    asDealIdString(parsed.sourceDealId) ??
+    asDealIdString(parsed.deal_id) ??
+    asDealIdString(parsed.dealId) ??
+    asDealIdString(parsed.hs_object_id) ??
+    null;
+
+  return { sourceHubspotDealId };
 }
 
 async function getAccessToken(config: RuntimeConfig): Promise<string> {
@@ -265,7 +314,52 @@ async function fetchAllCharges(config: RuntimeConfig, accessToken: string, order
   return allCharges;
 }
 
-async function fetchPlannedRowsWithoutSnapshot(supabase: ReturnType<typeof createClient>, batchSize: number): Promise<LedgerRow[]> {
+async function fetchPlannedRowsWithoutSnapshot(
+  supabase: ReturnType<typeof createClient>,
+  batchSize: number,
+  sourceHubspotDealId: string | null
+): Promise<LedgerRow[]> {
+  if (sourceHubspotDealId) {
+    const { data: filteredRowsData, error: filteredError } = await supabase
+      .from('renewal_ledger')
+      .select('subscription_id,term_end_date')
+      .eq('status', 'planned')
+      .eq('source_hubspot_deal_id', sourceHubspotDealId)
+      .order('term_end_date', { ascending: true })
+      .order('subscription_id', { ascending: true })
+      .limit(batchSize);
+
+    if (filteredError) {
+      throw new Error(`Failed to query renewal_ledger: ${filteredError.message}`);
+    }
+
+    const filteredRows = (filteredRowsData ?? []) as LedgerRow[];
+    if (filteredRows.length === 0) {
+      return [];
+    }
+
+    const subscriptionIds = Array.from(new Set(filteredRows.map((row) => row.subscription_id)));
+    const existingSnapshotKeys = new Set<string>();
+
+    if (subscriptionIds.length > 0) {
+      const { data: snapshotsData, error: snapshotsError } = await supabase
+        .from('renewal_snapshots')
+        .select('subscription_id,term_end_date')
+        .in('subscription_id', subscriptionIds);
+
+      if (snapshotsError) {
+        throw new Error(`Failed to query renewal_snapshots: ${snapshotsError.message}`);
+      }
+
+      const snapshots = (snapshotsData ?? []) as SnapshotKeyRow[];
+      for (const snapshot of snapshots) {
+        existingSnapshotKeys.add(keyOf(snapshot));
+      }
+    }
+
+    return filteredRows.filter((row) => !existingSnapshotKeys.has(keyOf(row)));
+  }
+
   const scanChunk = Math.max(batchSize * 3, batchSize);
   const selected: LedgerRow[] = [];
   const selectedKeys = new Set<string>();
@@ -357,6 +451,14 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
+  let requestOptions: RequestOptions;
+  try {
+    requestOptions = await getRequestOptions(req);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return jsonResponse(400, { error: message });
+  }
+
   try {
     const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
       auth: { persistSession: false }
@@ -379,7 +481,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
     };
 
     while (batchesProcessed < config.maxBatches) {
-      const ledgerBatch = await fetchPlannedRowsWithoutSnapshot(supabase, config.batchSize);
+      const ledgerBatch = await fetchPlannedRowsWithoutSnapshot(
+        supabase,
+        config.batchSize,
+        requestOptions.sourceHubspotDealId
+      );
       const fetchedBatchCount = ledgerBatch.length;
 
       if (fetchedBatchCount === 0) {
@@ -455,11 +561,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
       if (fetchedBatchCount < config.batchSize) {
         break;
       }
+
+      if (requestOptions.sourceHubspotDealId) {
+        break;
+      }
     }
 
     return jsonResponse(200, {
       batch_size: config.batchSize,
       max_batches: config.maxBatches,
+      requested_source_hubspot_deal_id: requestOptions.sourceHubspotDealId,
       batches_processed: batchesProcessed,
       snapshots_upserted: snapshotsUpsertedTotal,
       errors: errorsTotal,

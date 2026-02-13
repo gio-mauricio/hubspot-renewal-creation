@@ -73,8 +73,12 @@ function loadConfig(): RuntimeConfig {
   };
 }
 
+function getIngestSecretFromHeaders(headers: Headers): string | null {
+  return headers.get('x-ingest-secret') ?? headers.get('x_ingest_secret');
+}
+
 function isAuthorized(request: Request, expectedSecret: string): boolean {
-  const secret = request.headers.get('x-ingest-secret');
+  const secret = getIngestSecretFromHeaders(request.headers);
   if (!secret) {
     return false;
   }

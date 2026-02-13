@@ -52,6 +52,7 @@ type RequestOptions = {
   limit: number | null;
   dryRun: boolean;
   createLineItems: boolean;
+  sourceHubspotDealId: string | null;
 };
 
 type ChargeBuildResult =
@@ -167,6 +168,19 @@ function asNonEmptyString(value: unknown): string | null {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function asDealIdString(value: unknown): string | null {
+  const fromString = asNonEmptyString(value);
+  if (fromString) {
+    return fromString;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return String(Math.trunc(value));
+  }
+
+  return null;
 }
 
 function asFiniteNumber(value: unknown): number | null {
@@ -325,7 +339,8 @@ async function getRequestOptions(req: Request): Promise<RequestOptions> {
     return {
       limit: null,
       dryRun: false,
-      createLineItems: false
+      createLineItems: false,
+      sourceHubspotDealId: null
     };
   }
 
@@ -350,10 +365,19 @@ async function getRequestOptions(req: Request): Promise<RequestOptions> {
     throw new Error('Invalid request body: "create_line_items" must be a boolean');
   }
 
+  const sourceHubspotDealIdRaw =
+    asDealIdString(parsed.source_hubspot_deal_id) ??
+    asDealIdString(parsed.sourceDealId) ??
+    asDealIdString(parsed.deal_id) ??
+    asDealIdString(parsed.dealId) ??
+    asDealIdString(parsed.hs_object_id) ??
+    null;
+
   return {
     limit: parseLimit(parsed.limit),
     dryRun: dryRunRaw === true,
-    createLineItems: createLineItemsRaw === true
+    createLineItems: createLineItemsRaw === true,
+    sourceHubspotDealId: sourceHubspotDealIdRaw
   };
 }
 
@@ -466,6 +490,10 @@ function getHubSpotHeaders(token: string): Record<string, string> {
     Authorization: `Bearer ${token}`,
     Accept: 'application/json'
   };
+}
+
+function getIngestSecretFromHeaders(headers: Headers): string | null {
+  return headers.get('x-ingest-secret') ?? headers.get('x_ingest_secret');
 }
 
 function parseCharges(payload: unknown): Array<Record<string, unknown>> {
@@ -1031,7 +1059,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return jsonResponse(403, { error: "RUN_MODE must be 'test' to run this function" });
   }
 
-  const providedSecret = req.headers.get('x-ingest-secret');
+  const providedSecret = getIngestSecretFromHeaders(req.headers);
   if (!providedSecret || providedSecret !== config.ingestSecret) {
     return jsonResponse(401, { error: 'Unauthorized' });
   }
@@ -1067,6 +1095,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
       .from('renewals_ready_for_hubspot')
       .select('subscription_id,term_end_date,source_hubspot_deal_id,younium_charges_json')
       .order('term_end_date', { ascending: true });
+
+    if (requestOptions.sourceHubspotDealId) {
+      readyRowsQuery = readyRowsQuery.eq('source_hubspot_deal_id', requestOptions.sourceHubspotDealId);
+    }
 
     if (requestOptions.limit != null) {
       readyRowsQuery = readyRowsQuery.limit(requestOptions.limit);
@@ -1398,6 +1430,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     return jsonResponse(200, {
       requested_limit: requestOptions.limit ?? 'all',
+      requested_source_hubspot_deal_id: requestOptions.sourceHubspotDealId,
       processed: readyRows.length,
       created,
       errors,
